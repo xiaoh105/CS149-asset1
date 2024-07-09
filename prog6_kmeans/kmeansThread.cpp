@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <thread>
+#include <immintrin.h>
 
 #include "CycleTimer.h"
 
@@ -20,6 +21,7 @@ typedef struct {
   int M, N, K;
 } WorkerArgs;
 
+constexpr int kThreadNum = 16;
 
 /**
  * Checks if the algorithm has converged.
@@ -55,10 +57,33 @@ static bool stoppingConditionMet(double *prevCost, double *currCost,
  */
 double dist(double *x, double *y, int nDim) {
   double accum = 0.0;
-  for (int i = 0; i < nDim; i++) {
-    accum += pow((x[i] - y[i]), 2);
+  __m256d x_vec, y_vec;
+  double tmp[4];
+  for (int i = 0; i < nDim; i += 4) {
+    x_vec = _mm256_loadu_pd(x + i);
+    y_vec = _mm256_loadu_pd(y + i);
+    x_vec -= y_vec;
+    x_vec *= x_vec;
+    x_vec = _mm256_hadd_pd(x_vec, x_vec);
+    _mm256_storeu_pd(tmp, x_vec);
+    accum += tmp[0] + tmp[2];
+    // accum += pow((x[i] - y[i]), 2);
   }
   return sqrt(accum);
+}
+
+void computeAssignment(int thread_id, int k, double *minDist, WorkerArgs *const args) {
+  int block_size = args->M / kThreadNum;
+  int start_pos = thread_id * block_size;
+  int end_pos = std::min(args->M, (thread_id + 1) * block_size);
+  for (int m = start_pos; m < end_pos; m++) {
+    double d = dist(&args->data[m * args->N],
+                    &args->clusterCentroids[k * args->N], args->N);
+    if (d < minDist[m]) {
+      minDist[m] = d;
+      args->clusterAssignments[m] = k;
+    }
+  }
 }
 
 /**
@@ -75,13 +100,12 @@ void computeAssignments(WorkerArgs *const args) {
 
   // Assign datapoints to closest centroids
   for (int k = args->start; k < args->end; k++) {
-    for (int m = 0; m < args->M; m++) {
-      double d = dist(&args->data[m * args->N],
-                      &args->clusterCentroids[k * args->N], args->N);
-      if (d < minDist[m]) {
-        minDist[m] = d;
-        args->clusterAssignments[m] = k;
-      }
+    std::thread threads[kThreadNum];
+    for (int i = 0; i < kThreadNum; i++) {
+      threads[i] = std::thread(computeAssignment, i, k, minDist, args);
+    }
+    for (int i = 0; i < kThreadNum; i++) {
+      threads[i].join();
     }
   }
 
